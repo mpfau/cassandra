@@ -18,6 +18,9 @@
 package org.apache.cassandra.io.util;
 
 import java.io.*;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
@@ -63,24 +66,40 @@ public final class FileUtils
     public static final long ONE_TB = 1024 * ONE_GB;
 
     private static final DecimalFormat df = new DecimalFormat("#.##");
-    public static final boolean isCleanerAvailable;
+    public static final boolean isCleanerAvailable = true;
     private static final AtomicReference<Optional<FSErrorHandler>> fsErrorHandler = new AtomicReference<>(Optional.empty());
+
+    private static Class clsDirectBuffer;
+    private static MethodHandle mhDirectBufferCleaner;
+    private static MethodHandle mhCleanerClean;
 
     static
     {
-        boolean canClean = false;
         try
         {
+            clsDirectBuffer = Class.forName("sun.nio.ch.DirectBuffer");
+            Method mDirectBufferCleaner = clsDirectBuffer.getMethod("cleaner");
+            mhDirectBufferCleaner = MethodHandles.lookup().unreflect(mDirectBufferCleaner);
+            Method mCleanerClean = mDirectBufferCleaner.getReturnType().getMethod("clean");
+            mhCleanerClean = MethodHandles.lookup().unreflect(mCleanerClean);
+
             ByteBuffer buf = ByteBuffer.allocateDirect(1);
-            ((DirectBuffer) buf).cleaner().clean();
-            canClean = true;
+            clean(buf);
+        }
+        catch (IllegalAccessException e)
+        {
+            logger.error("FATAL: Cassandra is unable to access required classes. This usually means it has been " +
+                "run without the aid of the standard startup scripts or the scripts have been edited. If this was " +
+                "intentional, and you are attempting to use Java 11+ you may need to add the --add-exports and " +
+                "--add-opens jvm options from either jvm11-server.options or jvm11-client.options");
+            throw new RuntimeException(e);  // causes ExceptionInInitializerError, will prevent startup
         }
         catch (Throwable t)
         {
+            logger.error("FATAL: Cannot initialize optimized memory deallocator.");
             JVMStabilityInspector.inspectThrowable(t);
-            logger.info("Cannot initialize un-mmaper.  (Are you using a non-Oracle JVM?)  Compacted data files will not be removed promptly.  Consider using an Oracle JVM or using standard disk access mode");
+            throw new RuntimeException(t); // causes ExceptionInInitializerError, will prevent startup
         }
-        isCleanerAvailable = canClean;
     }
 
     public static void createHardLink(String from, String to)
@@ -342,13 +361,29 @@ public final class FileUtils
 
     public static void clean(ByteBuffer buffer)
     {
-        if (buffer == null)
+        if (buffer == null || !buffer.isDirect())
             return;
-        if (isCleanerAvailable && buffer.isDirect())
+
+        // TODO Once we can get rid of Java 8, it's simpler to call sun.misc.Unsafe.invokeCleaner(ByteBuffer),
+        // but need to take care of the attachment handling (i.e. whether 'buf' is a duplicate or slice) - that
+        // is different in sun.misc.Unsafe.invokeCleaner and this implementation.
+
+        try
         {
-            DirectBuffer db = (DirectBuffer) buffer;
-            if (db.cleaner() != null)
-                db.cleaner().clean();
+            Object cleaner = mhDirectBufferCleaner.bindTo(buffer).invoke();
+            if (cleaner != null)
+        {
+                // ((DirectBuffer) buf).cleaner().clean();
+                mhCleanerClean.bindTo(cleaner).invoke();
+            }
+        }
+        catch (RuntimeException e)
+        {
+            throw e;
+        }
+        catch (Throwable e)
+        {
+            throw new RuntimeException(e);
         }
     }
 
@@ -530,7 +565,7 @@ public final class FileUtils
         }
         catch (IOException e)
         {
-            logger.error("Error while getting {} folder size. {}", folder, e);
+            logger.error("Error while getting {} folder size. {}", folder, e.getMessage());
         }
         return sizeArr[0];
     }
